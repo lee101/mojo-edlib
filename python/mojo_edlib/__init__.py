@@ -7,6 +7,7 @@ equalities.  Inputs may be strings, bytes, or iterables of hashable values.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from itertools import groupby
 import re
 from typing import Any
 
@@ -34,7 +35,7 @@ def _values(value: Any, name: str) -> list[Any]:
 
 def _encode(
     query: list[Any], target: list[Any], additional_equalities: Any,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
     """Map hashable Python values to stable int64 symbols for the C ABI."""
     codes: dict[Any, int] = {}
 
@@ -77,7 +78,32 @@ def _encode(
         np.asarray(target_codes, dtype=np.int64),
         np.asarray(pairs, dtype=np.int64),
         alphabet_length,
+        alphabet_length,
     )
+
+
+def _encode_inputs(
+    query: Any, target: Any, additional_equalities: Any,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int]:
+    if additional_equalities is None and type(query) is type(target) and isinstance(query, bytes):
+        query_bytes, target_bytes = query, target
+    elif (
+        additional_equalities is None
+        and type(query) is type(target)
+        and isinstance(query, str)
+        and query.isascii()
+        and target.isascii()
+    ):
+        query_bytes, target_bytes = query.encode("ascii"), target.encode("ascii")
+    else:
+        return _encode(_values(query, "query"), _values(target, "target"), additional_equalities)
+
+    alphabet = sorted(set(query_bytes).union(target_bytes))
+    q = np.frombuffer(query_bytes, dtype=np.uint8).astype(np.int64)
+    t = np.frombuffer(target_bytes, dtype=np.uint8).astype(np.int64)
+    alphabet_length = len(alphabet)
+    mask_count = alphabet[-1] + 1 if alphabet else 0
+    return q, t, np.empty(0, dtype=np.int64), alphabet_length, mask_count
 
 
 def _end_columns(last_row: np.ndarray, mode: str, query_len: int) -> tuple[int, list[int]]:
@@ -94,6 +120,8 @@ def _end_columns(last_row: np.ndarray, mode: str, query_len: int) -> tuple[int, 
 def _equal(a: int, b: int, pairs: np.ndarray) -> bool:
     if a == b:
         return True
+    if not pairs.size:
+        return False
     for left, right in pairs.reshape(-1, 2):
         if (a == left and b == right) or (a == right and b == left):
             return True
@@ -171,6 +199,25 @@ def _trace(
     return start, "".join(encoded)
 
 
+def _native_trace(
+    matrix: np.ndarray, query: np.ndarray, target: np.ndarray, pairs: np.ndarray,
+    end_column: int,
+) -> tuple[int, str | None]:
+    operations = np.empty(len(query) + end_column, dtype=np.uint8)
+    trace_fn = lib().med_trace16 if matrix.dtype == np.uint16 else lib().med_trace
+    count = int(trace_fn(
+        query.ctypes.data, target.ctypes.data, pairs.ctypes.data, matrix.ctypes.data,
+        operations.ctypes.data, len(query), len(target), end_column, len(pairs) // 2,
+    ))
+    if count < 0:
+        raise RuntimeError("invalid DP traceback in Mojo kernel")
+    if not count:
+        return 0, None
+    forward = operations[:count].tobytes()[::-1]
+    cigar = "".join(f"{sum(1 for _ in group)}{chr(operation)}" for operation, group in groupby(forward))
+    return 0, cigar
+
+
 def align(
     query: Any,
     target: Any,
@@ -190,25 +237,26 @@ def align(
         raise ValueError("task must be one of 'distance', 'locations', or 'path'")
     if not isinstance(k, int) or k < -1:
         raise ValueError("k must be an integer greater than or equal to -1")
-    query_values, target_values = _values(query, "query"), _values(target, "target")
-    q, t, pairs, alphabet_length = _encode(query_values, target_values, additionalEqualities)
+    q, t, pairs, alphabet_length, mask_count = _encode_inputs(query, target, additionalEqualities)
     mode_code = _MODES[mode]
     # NumPy gives zero-length arrays a valid non-null data address, as required
     # by Mojo's non-nullable UnsafePointer ABI.
     if task == "distance":
         blocks = (len(q) + 63) // 64
         # The Mojo kernel views this allocation as UInt64 bit masks.  Keep that
-        # dtype explicit; query, target, pairs, and matrix are separately int64.
-        work = np.empty(258 * blocks, dtype=np.uint64)
+        # dtype explicit; symbol arrays are int64 and matrices use compact cells.
+        work = np.empty((mask_count + 2) * blocks, dtype=np.uint64)
         distance = int(lib().med_distance(
             q.ctypes.data, t.ctypes.data, pairs.ctypes.data, work.ctypes.data,
-            len(q), len(t), mode_code, len(pairs) // 2,
+            len(q), len(t), mode_code, len(pairs) // 2, mask_count,
         ))
         if mode == "NW" or not len(q):
             end_columns = [len(t)] if mode == "NW" else [0]
         else:
-            matrix = np.empty((len(q) + 1, len(t) + 1), dtype=np.int64)
-            distance = int(lib().med_matrix(
+            matrix_dtype = np.uint16 if max(len(q), len(t)) <= np.iinfo(np.uint16).max else np.int32
+            matrix = np.empty((len(q) + 1, len(t) + 1), dtype=matrix_dtype)
+            matrix_fn = lib().med_matrix16 if matrix_dtype == np.uint16 else lib().med_matrix
+            distance = int(matrix_fn(
                 q.ctypes.data, t.ctypes.data, pairs.ctypes.data, matrix.ctypes.data,
                 len(q), len(t), mode_code, len(pairs) // 2,
             ))
@@ -216,8 +264,10 @@ def align(
         locations: list[tuple[int | None, int]] = [(None, col - 1) for col in end_columns]
         cigar = None
     else:
-        matrix = np.empty((len(q) + 1, len(t) + 1), dtype=np.int64)
-        distance = int(lib().med_matrix(
+        matrix_dtype = np.uint16 if max(len(q), len(t)) <= np.iinfo(np.uint16).max else np.int32
+        matrix = np.empty((len(q) + 1, len(t) + 1), dtype=matrix_dtype)
+        matrix_fn = lib().med_matrix16 if matrix_dtype == np.uint16 else lib().med_matrix
+        distance = int(matrix_fn(
             q.ctypes.data, t.ctypes.data, pairs.ctypes.data, matrix.ctypes.data,
             len(q), len(t), mode_code, len(pairs) // 2,
         ))
@@ -227,7 +277,12 @@ def align(
             cigar = None
         else:
             starts = _hw_starts(matrix, q, t, pairs) if mode == "HW" else None
-            traced = [_trace(matrix, q, t, pairs, col, mode, starts) for col in end_columns]
+            if task == "locations" and mode != "HW":
+                traced = [(0, None) for _ in end_columns]
+            elif mode != "HW":
+                traced = [_native_trace(matrix, q, t, pairs, col) for col in end_columns]
+            else:
+                traced = [_trace(matrix, q, t, pairs, col, mode, starts) for col in end_columns]
             locations = [(start, col - 1) for col, (start, _) in zip(end_columns, traced)]
             cigar = traced[0][1] if task == "path" else None
     # edlib returns the direct empty-sequence result without applying k.

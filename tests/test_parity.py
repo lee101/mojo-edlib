@@ -71,10 +71,33 @@ def test_hashable_iterables_match_edlib():
 
 @pytest.mark.parametrize("query_length", [63, 4096])
 @pytest.mark.parametrize("mode", ["NW", "HW", "SHW"])
-def test_bit_vector_simd_tail_and_parallel_threshold_match_edlib(query_length, mode):
+def test_bit_vector_simd_tail_and_multiword_path_match_edlib(query_length, mode):
     query = "ACGT" * (query_length // 4) + "ACGT"[:query_length % 4]
     target = "TGCA" * 17
     assert mojo.align(query, target, mode=mode) == edlib.align(query, target, mode=mode)
+
+
+@pytest.mark.parametrize("target_length", [14, 15])
+def test_uint16_matrix_simd_tail_and_native_trace_match_edlib(target_length):
+    query = "ACGT" * 19
+    target = "TGCA" * (target_length // 4) + "TGCA"[:target_length % 4]
+    assert mojo.align(query, target, mode="NW", task="path") == edlib.align(
+        query, target, mode="NW", task="path"
+    )
+
+
+def test_int32_matrix_fallback_matches_edlib():
+    query, target = "A" * 65536, "A"
+    assert mojo.align(query, target, mode="NW", task="path") == edlib.align(
+        query, target, mode="NW", task="path"
+    )
+
+
+def test_ascii_bytes_fast_path_matches_edlib():
+    query, target = b"ACTG" * 17, b"ACGT" * 19
+    assert mojo.align(query, target, mode="NW", task="path") == edlib.align(
+        query, target, mode="NW", task="path"
+    )
 
 
 def test_unused_additional_equality_symbols_match_edlib():

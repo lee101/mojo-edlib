@@ -57,16 +57,23 @@ and include Python/ctypes call overhead.
 
 | case | mojo-edlib | edlib | ratio | result |
 | --- | ---: | ---: | ---: | --- |
-| NW distance (1000 x 1000) | 0.4 ms | 0.1 ms | 0.19x | slower |
-| NW distance (2000 x 2000) | 1.0 ms | 0.2 ms | 0.22x | slower |
-| NW path (800 x 800) | 4.1 ms | 0.2 ms | 0.04x | slower |
+| NW distance (1000 x 1000) | 0.1 ms | 0.1 ms | 0.60x | slower |
+| NW distance (2000 x 2000) | 0.4 ms | 0.2 ms | 0.55x | slower |
+| NW path (800 x 800) | 2.4 ms | 0.2 ms | 0.07x | slower |
 
-The distance task uses a multiword Myers bit-vector kernel. Its mask-table
-clear is SIMD-vectorized and its state update carries between words, so that
-update remains serial. Locations and traceback retain the full DP matrix
-required for their canonical public results. Upstream remains faster,
-particularly for paths, because it has a more mature bit-vector traceback
-implementation.
+The distance task uses a multiword Myers bit-vector kernel. ASCII strings and
+bytes avoid per-symbol Python dictionary work, and the SIMD-vectorized mask
+clear is limited to the symbol range actually needed. The state update carries
+between words, so that update remains serial. Locations and traceback retain
+the full DP matrix required for their canonical public results. Matrices use
+16-bit cells when the maximum possible distance fits and 32-bit cells otherwise;
+NW and SHW traceback runs in Mojo into a caller-owned byte buffer. Upstream
+remains faster, particularly for paths, because it has a more mature bit-vector
+traceback implementation.
+
+There is no parallel hot path. Myers updates carry between words, DP rows carry
+between cells, and the remaining independent setup work is below the point where
+thread launch overhead pays off for the measured cases.
 
 There is no GPU path. Edit-distance bit-vector updates have low arithmetic
 intensity and carry dependencies; host/device transfer and kernel launch cost
@@ -81,14 +88,13 @@ src/capi.mojo         C ABI exports and Myers/full-matrix alignment kernels
 dist/libmojo-edlib.so shared library built by Mojo
 ```
 
-The fast `distance` task uses a caller-owned bit-mask workspace, proportional
-to query length. The mask table is built directly in that NumPy allocation with no copy
-across the FFI boundary.
-`locations` and `path` use a caller-owned row-major matrix so Python can trace
-starts and CIGAR without
-allocation inside Mojo. Buffers cross the ABI as `Int` addresses and are
-rebuilt as `UnsafePointer[Int, AnyOrigin[mut=True]]`, matching the Mojo nightly
-FFI constraint.
+The fast `distance` task uses a caller-owned bit-mask workspace proportional to
+query length and the encoded symbol range. The mask table is built directly in
+that NumPy allocation with no copy across the FFI boundary. `locations` and
+`path` use a caller-owned row-major matrix, plus a caller-owned operation buffer
+for native traceback. Buffers cross the ABI as `Int` addresses and are rebuilt
+as typed pointers with mutable `AnyOrigin`, matching the Mojo nightly FFI
+constraint.
 
 ## License
 

@@ -23,8 +23,14 @@ def lib() -> ctypes.CDLL:
         if not os.path.exists(LIB):
             raise BuildError("Mojo library is missing; run `pixi run build` first")
         _lib = ctypes.CDLL(LIB)
-        for name in ("med_distance", "med_matrix"):
-            fn = getattr(_lib, name)
-            fn.argtypes = [I] * 8
-            fn.restype = I
+        _lib.med_distance.argtypes = [I] * 9
+        _lib.med_distance.restype = I
+        _lib.med_matrix.argtypes = [I] * 8
+        _lib.med_matrix.restype = I
+        _lib.med_matrix16.argtypes = [I] * 8
+        _lib.med_matrix16.restype = I
+        _lib.med_trace.argtypes = [I] * 9
+        _lib.med_trace.restype = I
+        _lib.med_trace16.argtypes = [I] * 9
+        _lib.med_trace16.restype = I
     return _lib

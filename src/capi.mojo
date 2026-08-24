@@ -3,8 +3,13 @@
 from std.sys.info import simd_width_of
 
 comptime Ptr = Pointer[Int, AnyOrigin[mut=True]]
+comptime MatrixPtr = Pointer[Int32, AnyOrigin[mut=True]]
+comptime Matrix16Ptr = Pointer[UInt16, AnyOrigin[mut=True]]
 comptime BitPtr = Pointer[UInt64, AnyOrigin[mut=True]]
+comptime BytePtr = Pointer[UInt8, AnyOrigin[mut=True]]
 comptime W = simd_width_of[DType.uint64]()
+comptime MATRIX_W = simd_width_of[DType.int32]()
+comptime MATRIX16_W = simd_width_of[DType.uint16]()
 
 
 def p(addr: Int) -> Ptr:
@@ -13,6 +18,18 @@ def p(addr: Int) -> Ptr:
 
 def bits(addr: Int) -> BitPtr:
     return BitPtr(unsafe_from_address=addr)
+
+
+def matrix_values(addr: Int) -> MatrixPtr:
+    return MatrixPtr(unsafe_from_address=addr)
+
+
+def matrix16_values(addr: Int) -> Matrix16Ptr:
+    return Matrix16Ptr(unsafe_from_address=addr)
+
+
+def bytes(addr: Int) -> BytePtr:
+    return BytePtr(unsafe_from_address=addr)
 
 
 def equal(a: Int, b: Int, pairs: Ptr, pair_count: Int) -> Bool:
@@ -24,6 +41,15 @@ def equal(a: Int, b: Int, pairs: Ptr, pair_count: Int) -> Bool:
         if (a == left and b == right) or (a == right and b == left):
             return True
     return False
+
+
+def clear_words(workspace: BitPtr, start: Int, stop: Int):
+    var vector_end = stop - (stop - start) % W
+    var zero = SIMD[DType.uint64, W](0)
+    for index in range(start, vector_end, W):
+        workspace.unsafe_store(index, zero)
+    for index in range(vector_end, stop):
+        workspace[unsafe_offset=index] = UInt64(0)
 
 
 def cell_min(diagonal: Int, up: Int, left: Int) -> Int:
@@ -44,24 +70,20 @@ def distance_myers(
     target_len: Int,
     mode: Int,
     pair_count: Int,
+    alphabet_len: Int,
 ) -> Int:
-    """Multiword Myers distance, with a 256-symbol bit-mask table in workspace."""
+    """Multiword Myers distance with a compact bit-mask table in workspace."""
     if query_len == 0:
         return target_len if mode == 0 else 0
 
     var block_count = (query_len + 63) // 64
-    var workspace_words = 258 * block_count
-    var vector_end = workspace_words - workspace_words % W
-    var zero = SIMD[DType.uint64, W](0)
-    for index in range(0, vector_end, W):
-        workspace.unsafe_store(index, zero)
-    for index in range(vector_end, workspace_words):
-        workspace[unsafe_offset=index] = UInt64(0)
+    var workspace_words = (alphabet_len + 2) * block_count
+    clear_words(workspace, 0, workspace_words)
     for index in range(query_len):
         var symbol = query[unsafe_offset=index]
         workspace[unsafe_offset=symbol * block_count + index // 64] |= UInt64(1) << UInt64(index % 64)
 
-    var pv_base = 256 * block_count
+    var pv_base = alphabet_len * block_count
     var mv_base = pv_base + block_count
     for block in range(block_count):
         workspace[unsafe_offset=pv_base + block] = ~UInt64(0)
@@ -118,32 +140,162 @@ def fill_matrix(
     query: Ptr,
     target: Ptr,
     pairs: Ptr,
-    matrix: Ptr,
+    matrix: MatrixPtr,
     query_len: Int,
     target_len: Int,
     mode: Int,
     pair_count: Int,
 ) -> Int:
     var stride = target_len + 1
-    for j in range(stride):
-        matrix[unsafe_offset=j] = 0 if mode == 1 else j
+    if mode == 1:
+        var vector_end = stride - stride % MATRIX_W
+        var zero = SIMD[DType.int32, MATRIX_W](0)
+        for j in range(0, vector_end, MATRIX_W):
+            matrix.unsafe_store(j, zero)
+        for j in range(vector_end, stride):
+            matrix[unsafe_offset=j] = Int32(0)
+    else:
+        for j in range(stride):
+            matrix[unsafe_offset=j] = Int32(j)
     for i in range(1, query_len + 1):
         var current = i * stride
-        matrix[unsafe_offset=current] = i
+        matrix[unsafe_offset=current] = Int32(i)
         for j in range(1, target_len + 1):
             var cost = 0 if equal(query[unsafe_offset=i - 1], target[unsafe_offset=j - 1], pairs, pair_count) else 1
-            matrix[unsafe_offset=current + j] = cell_min(
-                matrix[unsafe_offset=(i - 1) * stride + j - 1] + cost,
-                matrix[unsafe_offset=(i - 1) * stride + j] + 1,
-                matrix[unsafe_offset=current + j - 1] + 1,
-            )
-    var best = matrix[unsafe_offset=query_len * stride + target_len] if mode == 0 else matrix[unsafe_offset=query_len * stride]
+            matrix[unsafe_offset=current + j] = Int32(cell_min(
+                Int(matrix[unsafe_offset=(i - 1) * stride + j - 1]) + cost,
+                Int(matrix[unsafe_offset=(i - 1) * stride + j]) + 1,
+                Int(matrix[unsafe_offset=current + j - 1]) + 1,
+            ))
+    var best = Int(matrix[unsafe_offset=query_len * stride + target_len]) if mode == 0 else Int(matrix[unsafe_offset=query_len * stride])
     if mode != 0:
         for j in range(1, target_len + 1):
-            var value = matrix[unsafe_offset=query_len * stride + j]
+            var value = Int(matrix[unsafe_offset=query_len * stride + j])
             if value < best:
                 best = value
     return best
+
+
+def fill_matrix16(
+    query: Ptr,
+    target: Ptr,
+    pairs: Ptr,
+    matrix: Matrix16Ptr,
+    query_len: Int,
+    target_len: Int,
+    mode: Int,
+    pair_count: Int,
+) -> Int:
+    var stride = target_len + 1
+    if mode == 1:
+        var vector_end = stride - stride % MATRIX16_W
+        var zero = SIMD[DType.uint16, MATRIX16_W](0)
+        for j in range(0, vector_end, MATRIX16_W):
+            matrix.unsafe_store(j, zero)
+        for j in range(vector_end, stride):
+            matrix[unsafe_offset=j] = UInt16(0)
+    else:
+        for j in range(stride):
+            matrix[unsafe_offset=j] = UInt16(j)
+    for i in range(1, query_len + 1):
+        var current = i * stride
+        matrix[unsafe_offset=current] = UInt16(i)
+        for j in range(1, target_len + 1):
+            var cost = 0 if equal(query[unsafe_offset=i - 1], target[unsafe_offset=j - 1], pairs, pair_count) else 1
+            matrix[unsafe_offset=current + j] = UInt16(cell_min(
+                Int(matrix[unsafe_offset=(i - 1) * stride + j - 1]) + cost,
+                Int(matrix[unsafe_offset=(i - 1) * stride + j]) + 1,
+                Int(matrix[unsafe_offset=current + j - 1]) + 1,
+            ))
+    var best = Int(matrix[unsafe_offset=query_len * stride + target_len]) if mode == 0 else Int(matrix[unsafe_offset=query_len * stride])
+    if mode != 0:
+        for j in range(1, target_len + 1):
+            var value = Int(matrix[unsafe_offset=query_len * stride + j])
+            if value < best:
+                best = value
+    return best
+
+
+def trace_matrix(
+    query: Ptr,
+    target: Ptr,
+    pairs: Ptr,
+    matrix: MatrixPtr,
+    operations: BytePtr,
+    query_len: Int,
+    target_len: Int,
+    end_column: Int,
+    pair_count: Int,
+) -> Int:
+    var stride = target_len + 1
+    var i = query_len
+    var j = end_column
+    var count = 0
+    while i > 0 or j > 0:
+        var here = Int(matrix[unsafe_offset=i * stride + j])
+        if i > 0 and Int(matrix[unsafe_offset=(i - 1) * stride + j]) + 1 == here:
+            operations[unsafe_offset=count] = UInt8(73)
+            count += 1
+            i -= 1
+            continue
+        if j > 0 and Int(matrix[unsafe_offset=i * stride + j - 1]) + 1 == here:
+            operations[unsafe_offset=count] = UInt8(68)
+            count += 1
+            j -= 1
+            continue
+        if i > 0 and j > 0:
+            var is_match = equal(
+                query[unsafe_offset=i - 1], target[unsafe_offset=j - 1], pairs, pair_count
+            )
+            if Int(matrix[unsafe_offset=(i - 1) * stride + j - 1]) + (0 if is_match else 1) == here:
+                operations[unsafe_offset=count] = UInt8(61) if is_match else UInt8(88)
+                count += 1
+                i -= 1
+                j -= 1
+                continue
+        return -1
+    return count
+
+
+def trace_matrix16(
+    query: Ptr,
+    target: Ptr,
+    pairs: Ptr,
+    matrix: Matrix16Ptr,
+    operations: BytePtr,
+    query_len: Int,
+    target_len: Int,
+    end_column: Int,
+    pair_count: Int,
+) -> Int:
+    var stride = target_len + 1
+    var i = query_len
+    var j = end_column
+    var count = 0
+    while i > 0 or j > 0:
+        var here = Int(matrix[unsafe_offset=i * stride + j])
+        if i > 0 and Int(matrix[unsafe_offset=(i - 1) * stride + j]) + 1 == here:
+            operations[unsafe_offset=count] = UInt8(73)
+            count += 1
+            i -= 1
+            continue
+        if j > 0 and Int(matrix[unsafe_offset=i * stride + j - 1]) + 1 == here:
+            operations[unsafe_offset=count] = UInt8(68)
+            count += 1
+            j -= 1
+            continue
+        if i > 0 and j > 0:
+            var is_match = equal(
+                query[unsafe_offset=i - 1], target[unsafe_offset=j - 1], pairs, pair_count
+            )
+            if Int(matrix[unsafe_offset=(i - 1) * stride + j - 1]) + (0 if is_match else 1) == here:
+                operations[unsafe_offset=count] = UInt8(61) if is_match else UInt8(88)
+                count += 1
+                i -= 1
+                j -= 1
+                continue
+        return -1
+    return count
 
 
 @export("med_distance")
@@ -156,10 +308,11 @@ def med_distance(
     target_len: Int,
     mode: Int,
     pair_count: Int,
+    alphabet_len: Int,
 ) abi("C") -> Int:
     return distance_myers(
         p(query_addr), p(target_addr), p(pairs_addr), bits(work_addr), query_len,
-        target_len, mode, pair_count,
+        target_len, mode, pair_count, alphabet_len,
     )
 
 
@@ -175,6 +328,59 @@ def med_matrix(
     pair_count: Int,
 ) abi("C") -> Int:
     return fill_matrix(
-        p(query_addr), p(target_addr), p(pairs_addr), p(matrix_addr), query_len,
+        p(query_addr), p(target_addr), p(pairs_addr), matrix_values(matrix_addr), query_len,
         target_len, mode, pair_count,
+    )
+
+
+@export("med_matrix16")
+def med_matrix16(
+    query_addr: Int,
+    target_addr: Int,
+    pairs_addr: Int,
+    matrix_addr: Int,
+    query_len: Int,
+    target_len: Int,
+    mode: Int,
+    pair_count: Int,
+) abi("C") -> Int:
+    return fill_matrix16(
+        p(query_addr), p(target_addr), p(pairs_addr), matrix16_values(matrix_addr), query_len,
+        target_len, mode, pair_count,
+    )
+
+
+@export("med_trace")
+def med_trace(
+    query_addr: Int,
+    target_addr: Int,
+    pairs_addr: Int,
+    matrix_addr: Int,
+    operations_addr: Int,
+    query_len: Int,
+    target_len: Int,
+    end_column: Int,
+    pair_count: Int,
+) abi("C") -> Int:
+    return trace_matrix(
+        p(query_addr), p(target_addr), p(pairs_addr), matrix_values(matrix_addr),
+        bytes(operations_addr), query_len, target_len, end_column, pair_count,
+    )
+
+
+@export("med_trace16")
+def med_trace16(
+    query_addr: Int,
+    target_addr: Int,
+    pairs_addr: Int,
+    matrix_addr: Int,
+    operations_addr: Int,
+    query_len: Int,
+    target_len: Int,
+    end_column: Int,
+    pair_count: Int,
+) abi("C") -> Int:
+    return trace_matrix16(
+        p(query_addr), p(target_addr), p(pairs_addr), matrix16_values(matrix_addr),
+        bytes(operations_addr), query_len, target_len, end_column, pair_count,
     )
