@@ -57,9 +57,9 @@ and include Python/ctypes call overhead.
 
 | case | mojo-edlib | edlib | ratio | result |
 | --- | ---: | ---: | ---: | --- |
-| NW distance (1000 x 1000) | 0.1 ms | 0.1 ms | 0.60x | slower |
-| NW distance (2000 x 2000) | 0.4 ms | 0.2 ms | 0.55x | slower |
-| NW path (800 x 800) | 2.4 ms | 0.2 ms | 0.07x | slower |
+| NW distance (1000 x 1000) | 0.1 ms | 0.1 ms | 0.70x | slower |
+| NW distance (2000 x 2000) | 0.4 ms | 0.3 ms | 0.66x | slower |
+| NW path (800 x 800) | 2.6 ms | 0.2 ms | 0.06x | slower |
 
 The distance task uses a multiword Myers bit-vector kernel. ASCII strings and
 bytes avoid per-symbol Python dictionary work, and the SIMD-vectorized mask
